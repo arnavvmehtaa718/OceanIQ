@@ -1,12 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import {
-  computeAnalysis,
-  DEFAULT_INPUTS,
-  type ProcurementInputs,
-  type ProcurementAnalysis,
-} from "@/lib/calculations";
+import { DEFAULT_SCENARIO, type AnalysisResult, type ProcurementScenario } from "@/lib/types";
 
 export interface GeneratedReport {
   id: number;
@@ -23,7 +18,7 @@ export interface GeneratedReport {
   status: "READY";
   format: string;
   sections: string[];
-  analysis: ProcurementAnalysis;
+  analysis: AnalysisResult;
 }
 
 function dateLabel(d: Date): string {
@@ -32,25 +27,25 @@ function dateLabel(d: Date): string {
 }
 
 function buildReport(
-  analysis: ProcurementAnalysis,
+  analysis: AnalysisResult,
   id: number,
   format: string,
   sections: string[],
   scope?: string,
   date = new Date(),
 ): GeneratedReport {
-  const { inputs } = analysis;
+  const { scenario } = analysis;
   const name = scope || "Full Decision Brief";
   return {
     id,
     name,
-    route: `${inputs.loadingPort} \u2192 ${inputs.destinationPort}`,
-    cargo: inputs.cargo,
-    quantity: inputs.quantity,
-    voyages: inputs.voyages,
-    origin: inputs.originCountry,
-    loadingPort: inputs.loadingPort,
-    destinationPort: inputs.destinationPort,
+    route: `${scenario.loadingPort} → ${scenario.dischargePort}`,
+    cargo: scenario.cargo,
+    quantity: scenario.quantity,
+    voyages: scenario.voyages,
+    origin: scenario.originCountry,
+    loadingPort: scenario.loadingPort,
+    destinationPort: scenario.dischargePort,
     date: dateLabel(date),
     type: name,
     status: "READY",
@@ -95,13 +90,18 @@ interface AppState {
   toggleTheme: () => void;
 
   procurement: {
-    inputs: ProcurementInputs;
-    analysis: ProcurementAnalysis;
+    scenario: ProcurementScenario;
+    analysis: AnalysisResult | null;
   };
-  runAnalysis: (partial?: Partial<ProcurementInputs>) => ProcurementAnalysis;
+  isAnalysing: boolean;
+  analysisError: string | null;
+  /** Recomputes the analysis through the server pipeline. */
+  runAnalysis: (partial?: Partial<ProcurementScenario>) => Promise<AnalysisResult>;
+  /** Re-runs the current scenario, e.g. after a theme or settings change. */
+  refreshAnalysis: () => Promise<AnalysisResult | null>;
 
   reports: GeneratedReport[];
-  addReport: (format: string, sections: string[], scope?: string) => GeneratedReport;
+  addReport: (format: string, sections: string[], scope?: string) => Promise<GeneratedReport | null>;
 
   toasts: Toast[];
   pushToast: (t: Omit<Toast, "id">) => void;
@@ -113,7 +113,21 @@ interface AppState {
 
 let toastId = 1;
 
-const initialAnalysis = computeAnalysis(DEFAULT_INPUTS);
+async function postScenario(scenario: ProcurementScenario): Promise<AnalysisResult> {
+  const res = await fetch("/api/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scenario }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(
+      `Analysis failed (${res.status})${detail ? `: ${detail.slice(0, 200)}` : ""}`,
+    );
+  }
+  const body = (await res.json()) as { analysis: AnalysisResult };
+  return body.analysis;
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   isAuthenticated: false,
@@ -138,20 +152,45 @@ export const useAppStore = create<AppState>((set, get) => ({
   toggleTheme: () => get().setTheme(get().theme === "dark" ? "light" : "dark"),
 
   procurement: {
-    inputs: DEFAULT_INPUTS,
-    analysis: initialAnalysis,
+    scenario: DEFAULT_SCENARIO,
+    analysis: null,
   },
-  runAnalysis: (partial) => {
-    const current = get().procurement.inputs;
-    const next = { ...current, ...partial };
-    const analysis = computeAnalysis(next);
-    set({ procurement: { inputs: next, analysis } });
-    return analysis;
+  isAnalysing: false,
+  analysisError: null,
+
+  runAnalysis: async (partial) => {
+    const scenario = { ...get().procurement.scenario, ...partial };
+    set({ procurement: { scenario, analysis: get().procurement.analysis }, isAnalysing: true, analysisError: null });
+    try {
+      const analysis = await postScenario(scenario);
+      set({ procurement: { scenario: analysis.scenario, analysis }, isAnalysing: false });
+      return analysis;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Analysis failed";
+      set({ isAnalysing: false, analysisError: message });
+      throw err;
+    }
   },
 
-  reports: [buildReport(initialAnalysis, 1, "PDF", ["Freight forecast", "Contract strategy"])],
-  addReport: (format, sections, scope) => {
-    const analysis = get().procurement.analysis;
+  refreshAnalysis: async () => {
+    if (!get().procurement.analysis) return null;
+    try {
+      return await get().runAnalysis();
+    } catch {
+      return null;
+    }
+  },
+
+  reports: [],
+  addReport: async (format, sections, scope) => {
+    let analysis = get().procurement.analysis;
+    if (!analysis) {
+      try {
+        analysis = await get().runAnalysis();
+      } catch {
+        return null;
+      }
+    }
     const report = buildReport(analysis, get().reports.length + 1, format, sections, scope);
     set((s) => ({ reports: [report, ...s.reports] }));
     return report;

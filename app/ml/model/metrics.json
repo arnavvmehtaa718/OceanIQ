@@ -1,0 +1,62 @@
+{
+  "datasetKind": "synthetic_reference",
+  "disclaimer": "Metrics are measured on a held-out chronological tail of a SYNTHETIC/REFERENCE dataset. They are NOT claims about real chartering accuracy and must be recalibrated on SAIL historical fixtures before production use.",
+  "splitStrategy": "chronological_80_20_by_week",
+  "trainThroughDate": "2026-01-09",
+  "testFromDate": "2026-01-16",
+  "nTrainRows": 4350,
+  "nTestRows": 1073,
+  "nFeatures": 29,
+  "model": {
+    "name": "RandomForestRegressor",
+    "library": "scikit-learn",
+    "nEstimators": 120,
+    "maxDepth": 11,
+    "minSamplesLeaf": 4,
+    "maxFeatures": 0.65,
+    "randomState": 42
+  },
+  "train": {
+    "mae": 339.98,
+    "rmse": 460.66,
+    "mape": 1.8,
+    "r2": 0.9933
+  },
+  "test": {
+    "mae": 601.26,
+    "rmse": 823.7,
+    "mape": 2.92,
+    "r2": 0.9815
+  },
+  "featureImportances": {
+    "freight_lag_1w": 0.64328,
+    "freight_lag_2w": 0.19025,
+    "freight_slope_4w": 0.09336,
+    "freight_lag_4w": 0.03859,
+    "freight_ma_4w": 0.01914,
+    "vessel_payload_t": 0.00461,
+    "freight_mom_4w": 0.00108,
+    "month_cos": 0.00101,
+    "market_volatility": 0.0009,
+    "port_congestion": 0.00071,
+    "freight_std_13w": 0.00067,
+    "rate_vs_ma_13w": 0.00067,
+    "freight_zscore_13w": 0.00058,
+    "port_congestion_delta_4w": 0.00057,
+    "freight_ma_13w": 0.00055,
+    "freight_lag_8w": 0.00054,
+    "demand_index": 0.00053,
+    "bunker_index_usd_t": 0.0005,
+    "month_sin": 0.00046,
+    "vessel_size_class": 0.00044,
+    "corridor_code": 0.00033,
+    "vessel_fuel_index": 0.00032,
+    "month": 0.00025,
+    "season_code": 0.00014,
+    "route_distance_nm": 0.00014,
+    "corridor_distance_nm": 0.00014,
+    "quarter": 0.0001,
+    "cargo_code": 8e-05,
+    "cargo_stowage_factor": 6e-05
+  }
+}

@@ -1,6 +1,12 @@
 "use client";
 
-import { riskLevelOf } from "@/lib/calculations";
+import type { RiskLevel } from "@/lib/types";
+
+function riskLevelOf(score: number): RiskLevel {
+  if (score >= 70) return "High";
+  if (score >= 45) return "Medium";
+  return "Low";
+}
 
 interface RiskGaugeProps {
   score: number;

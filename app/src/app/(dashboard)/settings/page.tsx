@@ -15,7 +15,7 @@ import {
 import PageHeader from "@/components/ui/PageHeader";
 import ChartCard from "@/components/ui/ChartCard";
 import { useAppStore } from "@/store/useAppStore";
-import { PORTS, VESSELS } from "@/lib/mockData";
+import { LOADING_PORTS, VESSEL_ORDER, type VesselClass } from "@/lib/reference/corridors";
 
 const ROLES = ["Procurement Operator", "Procurement Analyst", "Risk Manager", "Executive"];
 
@@ -173,7 +173,7 @@ export default function SettingsPage() {
                   onChange={(e) => updateSettings({ defaultDestinationPort: e.target.value })}
                   className={`${inputClass} pl-9`}
                 >
-                  {PORTS.map((p) => (
+                  {LOADING_PORTS.map((p) => (
                     <option key={p.name}>{p.name}</option>
                   ))}
                 </select>
@@ -188,9 +188,9 @@ export default function SettingsPage() {
                 onChange={(e) => updateSettings({ defaultVessel: e.target.value })}
                 className={inputClass}
               >
-                {VESSELS.map((v) => (
-                  <option key={v.type}>{v.type}</option>
-                ))}
+                  {VESSEL_ORDER.map((v: VesselClass) => (
+                    <option key={v}>{v}</option>
+                  ))}
               </select>
             </div>
           </div>

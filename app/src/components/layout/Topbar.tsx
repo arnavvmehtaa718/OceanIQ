@@ -3,14 +3,15 @@
 import Link from "next/link";
 import { Bell, Moon, Search, Sun } from "lucide-react";
 import { useAppStore } from "@/store/useAppStore";
-import { ALERTS } from "@/lib/mockData";
+import { useAnalysis } from "@/hooks/useAnalysis";
 
 export default function Topbar() {
   const userName = useAppStore((s) => s.userName);
   const userRole = useAppStore((s) => s.userRole);
   const theme = useAppStore((s) => s.theme);
   const toggleTheme = useAppStore((s) => s.toggleTheme);
-  const openAlerts = ALERTS.filter((a) => a.status === "New").length;
+  const { analysis } = useAnalysis();
+  const openAlerts = analysis?.alerts.filter((a) => a.severity === "High").length ?? 0;
 
   return (
     <header className="sticky top-0 z-20 flex h-14 items-center gap-4 border-b border-line bg-navy/80 px-6 backdrop-blur-md">

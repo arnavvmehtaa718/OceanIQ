@@ -1,72 +1,101 @@
 "use client";
 
-import Link from "next/link";
-import {
-  Bell,
-  CheckCircle2,
-  ShieldAlert,
-  ShieldCheck,
-} from "lucide-react";
+import { Bell, CheckCircle2, ShieldAlert, ShieldCheck } from "lucide-react";
 import PageHeader from "@/components/ui/PageHeader";
 import ChartCard from "@/components/ui/ChartCard";
 import DataTable, { type Column } from "@/components/ui/DataTable";
 import RiskBadge from "@/components/ui/RiskBadge";
-import StatusBadge from "@/components/ui/StatusBadge";
+import LoadingState from "@/components/ui/LoadingState";
 import RiskGauge from "@/components/domain/RiskGauge";
-import AlertCard, { type AlertItem } from "@/components/domain/AlertCard";
+import AlertCard from "@/components/domain/AlertCard";
+import { useAnalysis } from "@/hooks/useAnalysis";
 import { useAppStore } from "@/store/useAppStore";
-import type { RiskItem } from "@/lib/calculations";
+import type { RiskComponent } from "@/lib/types";
 
 export default function RiskPage() {
-  const analysis = useAppStore((s) => s.procurement.analysis);
+  const { analysis, isLoading, error } = useAnalysis();
   const pushToast = useAppStore((s) => s.pushToast);
 
-  const { risks, alerts, riskScore, inputs } = analysis;
+  if (isLoading) return <LoadingState full label="Scoring risk across the pipeline…" />;
+  if (error || !analysis) {
+    return (
+      <div className="rounded-xl border border-bad/40 bg-card p-5">
+        <h2 className="text-[15px] font-semibold text-primary">Analysis unavailable</h2>
+        <p className="mt-1 text-[12.5px] text-secondary">{error ?? "No result returned."}</p>
+      </div>
+    );
+  }
 
-  const actions = Object.values(
-    risks.reduce<Record<string, { action: string; count: number }>>((acc, r) => {
-      acc[r.suggestedAction] = acc[r.suggestedAction] ?? { action: r.suggestedAction, count: 0 };
-      acc[r.suggestedAction].count += 1;
-      return acc;
-    }, {})
-  );
+  const { risk, alerts, scenario } = analysis;
 
-  const columns: Column<RiskItem>[] = [
+  const mitigations = risk.mitigations.map((m) => ({ mitigation: m }));
+
+  const columns: Column<RiskComponent>[] = [
     {
       header: "Risk Category",
       render: (r) => (
         <div className="flex items-center gap-2">
-          <span className={`grid size-7 place-items-center rounded-md ${r.color === "red" ? "bg-bad/12 text-bad" : r.color === "amber" ? "bg-warn/12 text-warn" : "bg-good/12 text-good"}`}>
+          <span
+            className={`grid size-7 place-items-center rounded-md ${
+              r.level === "High" ? "bg-bad/12 text-bad" : r.level === "Medium" ? "bg-warn/12 text-warn" : "bg-good/12 text-good"
+            }`}
+          >
             <ShieldAlert className="size-3.5" />
           </span>
-          <span className="font-medium text-primary">{r.category}</span>
+          <div>
+            <div className="font-medium text-primary">{r.label}</div>
+            <div className="text-[10px] text-secondary">weight {Math.round(r.weight * 100)}%</div>
+          </div>
         </div>
       ),
     },
-    { header: "Severity", render: (r) => <RiskBadge level={r.severity} label={r.severity} /> },
-    { header: "Probability", render: (r) => <StatusBadge status={r.probability} tone={r.probability === "High" ? "amber" : r.probability === "Medium" ? "blue" : "green"} /> },
-    { header: "Impact", render: (r) => <StatusBadge status={r.impact} tone={r.impact === "High" ? "red" : r.impact === "Medium" ? "amber" : "green"} /> },
     {
-      header: "Suggested Action",
+      header: "Severity",
+      render: (r) => <RiskBadge level={r.level} label={r.level} />,
+    },
+    {
+      header: "Score",
+      align: "right",
+      render: (r) => (
+        <div className="flex items-center justify-end gap-2">
+          <div className="h-1.5 w-14 overflow-hidden rounded-full bg-line">
+            <div
+              className={`h-full rounded-full ${r.level === "High" ? "bg-bad" : r.level === "Medium" ? "bg-warn" : "bg-good"}`}
+              style={{ width: `${r.score}%` }}
+            />
+          </div>
+          <span className="w-6 text-right text-primary">{r.score}</span>
+        </div>
+      ),
+    },
+    {
+      header: "Driver",
+      render: (r) => <span className="text-[11.5px] text-secondary">{r.driver}</span>,
+    },
+    {
+      header: "Mitigation",
       render: (r) => (
         <button
           onClick={() =>
-            pushToast({ kind: "info", title: r.suggestedAction, description: `Advisory queued for "${r.category}".` })
+            pushToast({
+              kind: "info",
+              title: r.mitigation,
+              description: `Advisory queued for "${r.label}".`,
+            })
           }
-          className="inline-flex items-center gap-1.5 text-[12px] font-medium text-accent transition-colors hover:text-primary"
+          className="inline-flex items-center gap-1.5 text-left text-[12px] font-medium text-accent transition-colors hover:text-primary"
         >
-          <CheckCircle2 className="size-3.5" /> {r.suggestedAction}
+          <CheckCircle2 className="size-3.5 shrink-0" /> {r.mitigation}
         </button>
       ),
     },
-    { header: "Status", render: (r) => <StatusBadge status={r.status} /> },
   ];
 
   return (
     <div>
       <PageHeader
         title="Risk & Alerts"
-        subtitle={`Quantified risk posture for the ${inputs.quantity.toLocaleString()} t ${inputs.cargo} program with live advisories and recommended mitigation actions.`}
+        subtitle={`Quantified risk posture for the ${scenario.quantity.toLocaleString()} t ${scenario.cargo} programme, with the advisories the pipeline raised.`}
         right={
           <span className="inline-flex items-center gap-1.5 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-[12px] font-medium text-warn">
             <Bell className="size-4" />
@@ -77,32 +106,27 @@ export default function RiskPage() {
 
       <div className="grid gap-4 xl:grid-cols-3">
         <div>
-          <ChartCard title="Program Risk Score" subtitle="Composite of market, port, weather & operations">
+          <ChartCard title="Programme Risk Score" subtitle="Weighted composite of the components below">
             <div className="flex justify-center">
-              <RiskGauge score={riskScore} />
+              <RiskGauge score={risk.score} />
             </div>
-            <div className="mt-3 flex items-start gap-2.5 rounded-lg border border-warn/25 bg-warn/5 p-3 text-[11.5px] leading-relaxed text-secondary">
+            <p className="mt-3 rounded-lg border border-line bg-panel p-3 text-[11.5px] leading-relaxed text-secondary">
+              {risk.label}
+            </p>
+            <div className="mt-2 flex items-start gap-2.5 rounded-lg border border-warn/25 bg-warn/5 p-3 text-[11.5px] leading-relaxed text-secondary">
               <ShieldCheck className="mt-0.5 size-4 shrink-0 text-warn" />
-              <span>
-                Score is driven chiefly by <span className="text-warn">freight volatility</span> and{" "}
-                <span className="text-warn">port congestion</span>. Current posture is {analysis.riskLevel.toLowerCase()}.
-              </span>
+              <span>{risk.caveat}</span>
             </div>
           </ChartCard>
         </div>
 
         <div>
-          <ChartCard title="Recommended Actions" subtitle="Grouped mitigation across all open risks">
+          <ChartCard title="Key Risk Drivers" subtitle="Highest weighted contributions to the score">
             <div className="space-y-2">
-              {actions.map((a) => (
-                <div key={a.action} className="flex items-center justify-between rounded-lg border border-line bg-panel px-3 py-2.5">
-                  <div className="flex items-center gap-2.5">
-                    <CheckCircle2 className="size-4 text-accent" />
-                    <span className="text-[12.5px] font-medium text-primary">{a.action}</span>
-                  </div>
-                  <span className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-secondary">
-                    {a.count} risk{a.count > 1 ? "s" : ""}
-                  </span>
+              {risk.keyDrivers.map((d) => (
+                <div key={d} className="flex items-start gap-2.5 rounded-lg border border-line bg-panel px-3 py-2.5">
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-accent" />
+                  <span className="text-[12.5px] text-primary">{d}</span>
                 </div>
               ))}
             </div>
@@ -110,27 +134,53 @@ export default function RiskPage() {
         </div>
 
         <div className="xl:row-span-2">
-          <ChartCard title="Alerts Timeline" subtitle="Chronological operational advisories">
-            <div className="space-y-2.5">
-              {alerts.map((a) => (
-                <AlertCard
-                  key={a.id}
-                  alert={a as AlertItem}
-                  onAction={(alert) =>
-                    pushToast({ kind: "warning", title: alert.action, description: `Auto-action queued for alert #${alert.id}.` })
-                  }
-                />
-              ))}
-            </div>
+          <ChartCard title="Advisories" subtitle="Raised by the pipeline for this scenario">
+            {alerts.length === 0 ? (
+              <p className="text-[12.5px] leading-relaxed text-secondary">
+                No advisory thresholds were crossed for this scenario. That is a modelled result, not a
+                clearance: the weighted components above still apply, and {risk.mitigations.length} standing
+                mitigation(s) remain in force.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {alerts.map((a) => (
+                  <AlertCard
+                    key={a.id}
+                    alert={a}
+                    onAction={(alert) =>
+                      pushToast({
+                        kind: "warning",
+                        title: alert.action,
+                        description: `Advisory queued for "${alert.title}".`,
+                      })
+                    }
+                  />
+                ))}
+              </div>
+            )}
           </ChartCard>
         </div>
 
         <div className="xl:col-span-2">
-          <ChartCard title="Risk Matrix" subtitle="Probability \u00D7 impact with mitigation and status">
-            <DataTable columns={columns} data={risks} rowKey={(r) => r.category} />
+          <ChartCard title="Risk Matrix" subtitle="Score, weight, driver and mitigation per component">
+            <DataTable columns={columns} data={risk.components} rowKey={(r) => r.key} />
           </ChartCard>
         </div>
       </div>
+
+      {mitigations.length > 0 && (
+        <div className="mt-4">
+          <ChartCard title="Standing Mitigations" subtitle="Applied regardless of the current score">
+            <ul className="space-y-1.5">
+              {risk.mitigations.map((m) => (
+                <li key={m} className="text-[12.5px] leading-relaxed text-secondary">
+                  · {m}
+                </li>
+              ))}
+            </ul>
+          </ChartCard>
+        </div>
+      )}
     </div>
   );
 }

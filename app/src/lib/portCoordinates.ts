@@ -22,6 +22,7 @@ export const PORT_COORDS: Record<string, PortCoord> = {
   Tarahan: { lat: -5.5129, lng: 105.4099 },
 
   // ---- Brazil (loading) ----
+  Tubarao: { lat: -20.283, lng: -40.2567 },
   "Tubar\u00E3o": { lat: -20.283, lng: -40.2567 },
   Itaqui: { lat: -2.573, lng: -44.3606 },
 

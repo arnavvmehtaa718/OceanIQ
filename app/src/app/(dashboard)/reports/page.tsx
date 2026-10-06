@@ -9,6 +9,7 @@ import {
   Eye,
   FileBarChart2,
   FileDown,
+  Info,
   Loader2,
   Square,
 } from "lucide-react";
@@ -16,21 +17,28 @@ import PageHeader from "@/components/ui/PageHeader";
 import ChartCard from "@/components/ui/ChartCard";
 import DataTable, { type Column } from "@/components/ui/DataTable";
 import StatusBadge from "@/components/ui/StatusBadge";
+import LoadingState from "@/components/ui/LoadingState";
+import { useAnalysis } from "@/hooks/useAnalysis";
 import { useAppStore, type GeneratedReport } from "@/store/useAppStore";
-import { formatUSD } from "@/lib/calculations";
+import { formatNumber, formatUSD } from "@/lib/format";
 
 const SCOPES = ["Full Decision Brief", "Cost & Savings Summary", "Risk Register", "Vessel & Port Annex"];
 const FORMATS = ["PDF", "Excel", "CSV"];
-const SECTIONS = ["Freight forecast", "Vessel compatibility", "Port congestion", "Route comparison", "Contract strategy", "Risk matrix"];
+const SECTIONS = [
+  "Freight forecast",
+  "Vessel compatibility",
+  "Port congestion",
+  "Route comparison",
+  "Contract strategy",
+  "Risk matrix",
+];
 
 export default function ReportsPage() {
   const router = useRouter();
-  const analysis = useAppStore((s) => s.procurement.analysis);
+  const { analysis, isLoading } = useAnalysis();
   const reports = useAppStore((s) => s.reports);
   const addReport = useAppStore((s) => s.addReport);
   const pushToast = useAppStore((s) => s.pushToast);
-
-  const { inputs } = analysis;
 
   const [scope, setScope] = useState(SCOPES[0]);
   const [format, setFormat] = useState("PDF");
@@ -42,16 +50,30 @@ export default function ReportsPage() {
 
   const generate = async () => {
     setGenerating(true);
-    await new Promise((r) => setTimeout(r, 400));
-    const report = addReport(format, sections, scope);
+    const report = await addReport(format, sections, scope);
     setGenerating(false);
+    if (!report) {
+      pushToast({
+        kind: "warning",
+        title: "Report failed",
+        description: "The analysis could not be produced, so no report was created.",
+      });
+      return;
+    }
     pushToast({
       kind: "success",
       title: "Report generated",
-      description: `${report.name} (${format}) is ready in your saved reports${sections.length ? " \u00B7 includes " + sections.length + " sections" : ""}.`,
+      description: `${report.name} (${format}) is ready in your saved reports${
+        sections.length ? " · includes " + sections.length + " sections" : ""
+      }.`,
     });
     router.push(`/reports/${report.id}`);
   };
+
+  if (isLoading || !analysis) return <LoadingState full label="Preparing report context…" />;
+
+  const latest = reports[0];
+  const saving = analysis.savings.savings >= 0;
 
   const columns: Column<GeneratedReport>[] = [
     {
@@ -68,9 +90,14 @@ export default function ReportsPage() {
         </div>
       ),
     },
-    { header: "Type", render: (r) => <span className="text-secondary">{r.type}</span> },
+    { header: "Scope", render: (r) => <span className="text-secondary">{r.type}</span> },
     { header: "Cargo", render: (r) => <span className="text-secondary">{r.cargo}</span> },
-    { header: "Quantity", render: (r) => <span className="text-secondary">{r.quantity.toLocaleString()} t</span> },
+    {
+      header: "Quantity",
+      align: "right",
+      render: (r) => <span className="text-secondary">{formatNumber(r.quantity)} t</span>,
+    },
+    { header: "Format", render: (r) => <span className="text-secondary">{r.format}</span> },
     { header: "Generated", render: (r) => <span className="text-secondary">{r.date}</span> },
     { header: "Status", render: (r) => <StatusBadge status={r.status} tone="green" /> },
     {
@@ -85,7 +112,13 @@ export default function ReportsPage() {
             <Eye className="size-3.5" />
           </button>
           <button
-            onClick={() => pushToast({ kind: "success", title: "Download started", description: `${r.name} (${r.format}) is being exported.` })}
+            onClick={() =>
+              pushToast({
+                kind: "success",
+                title: "Export queued",
+                description: `${r.name} (${r.format}) is being prepared for download.`,
+              })
+            }
             className="grid size-7 place-items-center rounded-md border border-line text-secondary transition-colors hover:border-good/40 hover:text-good"
             title="Download"
           >
@@ -100,58 +133,87 @@ export default function ReportsPage() {
     <div>
       <PageHeader
         title="Reports & Downloads"
-        subtitle={`Exportable decision artifacts for the ${inputs.cargo} chartering program \u2014 ready the latest brief or generate a custom report.`}
+        subtitle={`Exportable decision artifacts for the ${analysis.scenario.cargo} chartering programme — ready the latest brief or generate a custom report.`}
       />
 
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="xl:col-span-2">
           <div className="relative overflow-hidden rounded-2xl border border-accent/35 bg-gradient-to-br from-card to-panel p-5">
             <div className="mb-2 inline-flex items-center gap-1.5 rounded-md bg-good/15 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-good">
-              <Crown className="size-3.5" /> Latest decision report
+              <Crown className="size-3.5" />
+              {latest ? "Latest decision report" : "Current decision brief"}
             </div>
-            <h2 className="text-[19px] font-semibold text-primary">{reports[0].name}</h2>
+            <h2 className="text-[19px] font-semibold text-primary">
+              {latest ? latest.name : `${analysis.scenario.cargo} · ${analysis.scenario.contractHorizon}`}
+            </h2>
             <p className="mt-1 text-[12.5px] text-secondary">
-              {reports[0].route} \u00B7 {reports[0].cargo} ({reports[0].quantity.toLocaleString()} t \u00B7 {reports[0].voyages} voyages) \u00B7 generated {reports[0].date}
+              {analysis.route.selected.name} · {analysis.scenario.cargo} (
+              {formatNumber(analysis.totalQuantity)} t · {analysis.scenario.voyages} voyage
+              {analysis.scenario.voyages === 1 ? "" : "s"})
+              {latest ? ` · generated ${latest.date}` : " · not yet generated"}
             </p>
             <div className="mt-4 grid gap-3 sm:grid-cols-3">
-              <MiniStat label="Expected cost" value={formatUSD(reports[0].analysis.costs.total)} />
-              <MiniStat label="Savings" value={formatUSD(reports[0].analysis.potentialSavingsUSD)} good />
-              <MiniStat label="Confidence" value={`${reports[0].analysis.confidence}%`} />
+              <MiniStat label="Programme cost" value={formatUSD(analysis.cost.totalProgram)} />
+              <MiniStat
+                label={saving ? "Savings vs spot" : "Premium vs spot"}
+                value={formatUSD(Math.abs(analysis.savings.savings))}
+                good={saving}
+              />
+              <MiniStat label="Forecast confidence" value={`${analysis.forecast.confidence}%`} />
             </div>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
-                onClick={() => router.push(`/reports/${reports[0].id}`)}
-                className="inline-flex items-center gap-2 rounded-lg bg-blue-nav px-4 py-2 text-[12.5px] font-medium text-white transition-colors hover:bg-blue-glow"
+                onClick={() => {
+                  if (latest) router.push(`/reports/${latest.id}`);
+                  else generate();
+                }}
+                disabled={generating}
+                className="inline-flex items-center gap-2 rounded-lg bg-blue-nav px-4 py-2 text-[12.5px] font-medium text-white transition-colors hover:bg-blue-glow disabled:opacity-50"
               >
-                <Eye className="size-4" /> Preview Brief
+                <Eye className="size-4" /> {latest ? "Preview Brief" : "Generate Brief"}
               </button>
               <button
                 onClick={() =>
-                  pushToast({ kind: "success", title: "Download started", description: `${reports[0].name} (${reports[0].format})` })
+                  pushToast({
+                    kind: "success",
+                    title: "Export queued",
+                    description: latest
+                      ? `${latest.name} (${latest.format}) is being prepared for download.`
+                      : "Generate a report first, then export it.",
+                  })
                 }
-                className="inline-flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-[12.5px] font-medium text-secondary transition-colors hover:border-accent/40 hover:text-primary"
+                disabled={!latest}
+                className="inline-flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-[12.5px] font-medium text-secondary transition-colors hover:border-accent/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <Download className="size-4" /> Download {reports[0].format}
+                <Download className="size-4" /> Download {latest ? latest.format : format}
               </button>
             </div>
           </div>
         </div>
 
         <div>
-          <ChartCard title="Generate New Report" subtitle="Compose an exportable brief from the current scenario">
+          <ChartCard title="Generate New Report" subtitle="Compose an exportable brief from the current analysis">
             <div className="space-y-3.5">
               <div>
-                <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-secondary">Report scope</label>
+                <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-secondary">
+                  Report scope
+                </label>
                 <div className="space-y-1.5">
                   {SCOPES.map((s) => (
                     <button
                       key={s}
                       onClick={() => setScope(s)}
                       className={`flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-[12px] transition-colors ${
-                        scope === s ? "border-accent bg-accent/10 text-accent" : "border-line bg-panel text-secondary hover:border-accent/40"
+                        scope === s
+                          ? "border-accent bg-accent/10 text-accent"
+                          : "border-line bg-panel text-secondary hover:border-accent/40"
                       }`}
                     >
-                      {scope === s ? <CheckSquare className="size-3.5 shrink-0" /> : <Square className="size-3.5 shrink-0" />}
+                      {scope === s ? (
+                        <CheckSquare className="size-3.5 shrink-0" />
+                      ) : (
+                        <Square className="size-3.5 shrink-0" />
+                      )}
                       {s}
                     </button>
                   ))}
@@ -159,14 +221,18 @@ export default function ReportsPage() {
               </div>
 
               <div>
-                <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-secondary">Format</label>
+                <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-wider text-secondary">
+                  Format
+                </label>
                 <div className="grid grid-cols-3 gap-1.5">
                   {FORMATS.map((f) => (
                     <button
                       key={f}
                       onClick={() => setFormat(f)}
                       className={`rounded-lg border py-1.5 text-[12px] font-medium transition-colors ${
-                        format === f ? "border-accent bg-accent/10 text-accent" : "border-line bg-panel text-secondary hover:border-accent/40"
+                        format === f
+                          ? "border-accent bg-accent/10 text-accent"
+                          : "border-line bg-panel text-secondary hover:border-accent/40"
                       }`}
                     >
                       {f}
@@ -219,16 +285,36 @@ export default function ReportsPage() {
       <div className="mt-4">
         <ChartCard
           title="Saved Reports"
-          subtitle={`All generated artifacts \u00B7 ${reports.length} on record`}
+          subtitle={
+            reports.length ? `All generated artifacts · ${reports.length} on record` : "No reports generated yet"
+          }
           right={
             <span className="inline-flex items-center gap-1 text-[11.5px] font-medium text-accent">
-              {inputs.loadingPort} \u2192 {inputs.destinationPort}
+              {analysis.scenario.loadingPort} → {analysis.scenario.dischargePort}
             </span>
           }
         >
-          <DataTable columns={columns} data={reports} rowKey={(r) => `${r.id}-${r.name}`} />
+          {reports.length ? (
+            <DataTable columns={columns} data={reports} rowKey={(r) => `${r.id}-${r.name}`} />
+          ) : (
+            <div className="flex flex-col items-center gap-2 py-10 text-center">
+              <FileBarChart2 className="size-8 text-secondary/50" />
+              <p className="text-[13px] font-medium text-primary">No saved reports</p>
+              <p className="max-w-sm text-[11.5px] leading-relaxed text-secondary">
+                Generate a report from the current analysis to keep a decision brief on record. Reports snapshot the
+                analysis exactly as it stands when generated.
+              </p>
+            </div>
+          )}
         </ChartCard>
       </div>
+
+      <p className="mt-4 flex items-start gap-3 rounded-xl border border-line bg-panel p-3 text-[11px] leading-relaxed text-secondary">
+        <Info className="mt-0.5 size-3.5 shrink-0 text-accent" />
+        Report contents are derived from the deterministic pipeline over {analysis.model.dataLabel.toLowerCase()}
+        trained through {analysis.referenceAsOf}. Figures are modelled estimates, not quotations, and every report
+        carries that disclosure.
+      </p>
     </div>
   );
 }

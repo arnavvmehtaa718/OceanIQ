@@ -1,95 +1,93 @@
 "use client";
 
 import { useState } from "react";
-import {
-  CheckCircle2,
-  Ship,
-  Waves,
-} from "lucide-react";
+import { Anchor, Waves } from "lucide-react";
 import PageHeader from "@/components/ui/PageHeader";
 import ChartCard from "@/components/ui/ChartCard";
 import DataTable, { type Column } from "@/components/ui/DataTable";
 import StatusBadge from "@/components/ui/StatusBadge";
+import LoadingState from "@/components/ui/LoadingState";
 import VesselCard from "@/components/domain/VesselCard";
-import { useAppStore } from "@/store/useAppStore";
-import type { VesselRecommendation } from "@/lib/calculations";
-
-interface VesselSpec {
-  draft: number;
-  loa: number;
-  beam: number;
-  cargo: number;
-}
-
-const VESSEL_SPECS: Record<string, VesselSpec> = {
-  Handysize: { draft: 10.5, loa: 180, beam: 28, cargo: 32000 },
-  Supramax: { draft: 12.8, loa: 199, beam: 32, cargo: 58000 },
-  Panamax: { draft: 13.5, loa: 225, beam: 32, cargo: 70000 },
-  Capesize: { draft: 18.9, loa: 292, beam: 45, cargo: 150000 },
-};
-
-interface ConstraintRow {
-  constraint: string;
-  unit: string;
-  limit: string;
-  required: string;
-}
-
-function compliance(spec: VesselSpec, constraint: string, portConstraints: { draft: number; loa: number; beam: number; cargo: number }): "Pass" | "Restricted" | "Fail" {
-  const v = constraint === "Draft"
-    ? spec.draft
-    : constraint === "Length overall (LOA)"
-      ? spec.loa
-      : constraint === "Beam"
-        ? spec.beam
-        : spec.cargo;
-  const limit = constraint === "Cargo handling" ? portConstraints.cargo : constraint === "Draft" ? portConstraints.draft : constraint === "Beam" ? portConstraints.beam : portConstraints.loa;
-  if (v > limit) return "Fail";
-  return "Pass";
-}
+import { useAnalysis } from "@/hooks/useAnalysis";
+import { formatNumber, formatUSD } from "@/lib/format";
+import { VESSEL_REFERENCE } from "@/lib/reference/corridors";
+import type { PortConstraintCheck, VesselEvaluation } from "@/lib/types";
 
 export default function VesselsPage() {
-  const analysis = useAppStore((s) => s.procurement.analysis);
-  const [selected, setSelected] = useState<VesselRecommendation | null>(analysis.vessels.find((v) => v.recommended) ?? null);
+  const { analysis, isLoading, error } = useAnalysis();
+  const [inspected, setInspected] = useState<string | null>(null);
 
-  const { inputs, selectedPort } = analysis;
-  const portConstraints = { draft: selectedPort.maxDraft, loa: selectedPort.maxLOA, beam: selectedPort.maxBeam, cargo: selectedPort.cargoHandlingCapacity };
+  if (isLoading) return <LoadingState full label="Screening vessel classes…" />;
+  if (error || !analysis) {
+    return (
+      <div className="rounded-xl border border-bad/40 bg-card p-5">
+        <h2 className="text-[15px] font-semibold text-primary">Analysis unavailable</h2>
+        <p className="mt-1 text-[12.5px] text-secondary">{error ?? "No result returned."}</p>
+      </div>
+    );
+  }
 
-  const constraintRows: ConstraintRow[] = [
-    { constraint: "Draft", unit: "m", limit: portConstraints.draft.toFixed(1), required: (portConstraints.draft - 1).toFixed(1) },
-    { constraint: "Length overall (LOA)", unit: "m", limit: portConstraints.loa.toString(), required: (portConstraints.loa - 20).toString() },
-    { constraint: "Beam", unit: "m", limit: portConstraints.beam.toString(), required: (portConstraints.beam - 8).toString() },
-    { constraint: "Cargo handling", unit: "t/day", limit: portConstraints.cargo.toLocaleString(), required: inputs.quantity.toLocaleString() },
-  ];
+  const { vessel, port, scenario } = analysis;
+  const selected =
+    vessel.all.find((v) => v.type === inspected) ?? vessel.primary;
 
-  const columns: Column<VesselRecommendation>[] = [
+  const columns: Column<VesselEvaluation>[] = [
     {
       header: "Vessel",
       render: (v) => (
         <div className="flex items-center gap-2">
-          <Ship className="size-4 text-accent" />
-          <div>
-            <div className="font-medium text-primary">{v.type}</div>
-            <div className="text-[10px] text-secondary">{v.dwt}</div>
-          </div>
+          <span className="text-[13px] font-medium text-primary">{v.type}</span>
+          <span className="text-[10px] text-secondary">{v.dwtLabel}</span>
           {v.recommended && (
             <span className="rounded bg-good/15 px-1.5 py-0.5 text-[9.5px] font-semibold uppercase text-good">
               Recommended
+            </span>
+          )}
+          {v.portCompatibility === "Fail" && (
+            <span className="rounded bg-bad/15 px-1.5 py-0.5 text-[9.5px] font-semibold uppercase text-bad">
+              No berth
             </span>
           )}
         </div>
       ),
     },
     {
-      header: "Charter Cost",
+      header: "Payload",
+      align: "right",
+      render: (v) => <span className="text-primary">{formatNumber(v.payload)} t</span>,
+    },
+    {
+      header: "Parcel fit",
       align: "right",
       render: (v) => (
-        <span className="text-primary">${v.costPerDay.toLocaleString()}/day</span>
+        <span className="text-primary">
+          {v.utilisationPercent}% · {Math.ceil(scenario.quantity / v.payload)}{" "}
+          {Math.ceil(scenario.quantity / v.payload) > 1 ? "voyages" : "voyage"}
+        </span>
       ),
     },
     {
+      header: "Implied rate",
+      align: "right",
+      render: (v) => <span className="text-primary">{formatUSD(v.impliedDailyRate)}/day</span>,
+    },
+    {
       header: "Availability",
-      render: (v) => <StatusBadge status={v.availability} tone={v.availability === "High" ? "green" : v.availability === "Medium" ? "amber" : "red"} />,
+      render: (v) => (
+        <StatusBadge
+          status={v.availability}
+          tone={v.availability === "High" ? "green" : v.availability === "Medium" ? "amber" : "red"}
+        />
+      ),
+    },
+    {
+      header: port.selected.name,
+      render: (v) => (
+        <StatusBadge
+          status={v.portCompatibility}
+          tone={v.portCompatibility === "Pass" ? "green" : v.portCompatibility === "Restricted" ? "amber" : "red"}
+        />
+      ),
     },
     {
       header: "Score",
@@ -98,17 +96,53 @@ export default function VesselsPage() {
         <div className="flex items-center justify-end gap-2">
           <div className="h-1.5 w-16 overflow-hidden rounded-full bg-line">
             <div
-              className={`h-full rounded-full ${v.score >= 70 ? "bg-good" : v.score >= 50 ? "bg-warn" : "bg-bad"}`}
+              className={`h-full rounded-full ${v.portCompatibility === "Fail" ? "bg-bad" : v.score >= 70 ? "bg-good" : v.score >= 40 ? "bg-warn" : "bg-bad"}`}
               style={{ width: `${v.score}%` }}
             />
           </div>
-          <span className="w-8 text-primary">{v.score}</span>
+          <span className="w-6 text-right text-primary">{v.score}</span>
+        </div>
+      ),
+    },
+  ];
+
+  const checkColumns: Column<PortConstraintCheck>[] = [
+    {
+      header: "Constraint",
+      render: (c) => (
+        <div>
+          <div className="font-medium text-primary">{c.name}</div>
         </div>
       ),
     },
     {
-      header: selectedPort.name,
-      render: (v) => <StatusBadge status={v.portCompatibility} tone={v.portCompatibility === "Pass" ? "green" : v.portCompatibility === "Restricted" ? "amber" : "red"} />,
+      header: "Required",
+      align: "right",
+      render: (c) => <span className="text-secondary">{c.required} {c.unit}</span>,
+    },
+    {
+      header: `${port.selected.name} limit`,
+      align: "right",
+      render: (c) => <span className="text-secondary">{c.limit} {c.unit}</span>,
+    },
+    {
+      header: "Margin",
+      align: "right",
+      render: (c) => (
+        <span className={c.margin >= 0 ? "text-good" : "text-bad"}>
+          {c.margin >= 0 ? "+" : ""}
+          {c.margin} {c.unit}
+        </span>
+      ),
+    },
+    {
+      header: "Status",
+      render: (c) => (
+        <StatusBadge
+          status={c.status}
+          tone={c.status === "Pass" ? "green" : c.status === "Restricted" ? "amber" : "red"}
+        />
+      ),
     },
   ];
 
@@ -116,26 +150,16 @@ export default function VesselsPage() {
     <div>
       <PageHeader
         title="Vessel Recommendation"
-        subtitle={`Fleet compatibility screening against ${selectedPort.name} constraints for ${inputs.quantity.toLocaleString()} t ${inputs.cargo} with recommended charter pick.`}
+        subtitle={`Fleet screening against ${port.selected.name} constraints for a ${formatNumber(scenario.quantity)} t ${scenario.cargo} parcel.`}
       />
 
       <div className="grid gap-4 pt-2 md:grid-cols-2 xl:grid-cols-4">
-        {analysis.vessels.map((v) => (
+        {vessel.all.map((v) => (
           <VesselCard
             key={v.type}
-            vessel={{
-              type: v.type,
-              dwt: v.dwt,
-              portCompatibility: v.portCompatibility,
-              estimatedCost: v.costPerDay,
-              costPerDay: v.costPerDay,
-              recommended: v.recommended,
-              score: v.score,
-              availability: v.availability,
-              compatibilityScore: v.compatibilityScore,
-            }}
-            selected={selected?.type === v.type}
-            onSelect={setSelected as any}
+            vessel={v}
+            selected={selected.type === v.type}
+            onSelect={(next) => setInspected(next.type)}
           />
         ))}
       </div>
@@ -143,82 +167,108 @@ export default function VesselsPage() {
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
         <div className="xl:col-span-2">
           <ChartCard
-            title={`${selectedPort.name} Port Constraints vs Vessel Specifications`}
-            subtitle="Spec-level compliance against draft, LOA, beam and cargo-handling limits"
-            right={
-              <span className="inline-flex items-center gap-1.5 text-[11px] text-good">
-                <CheckCircle2 className="size-3.5" />
-                {selected?.type} fits constraints
-              </span>
-            }
+            title={`${port.selected.name} Constraint Check`}
+            subtitle="Every vessel against the port's hard physical limits and its handling rate"
           >
-            <DataTable
-              columns={[
-                { header: "Constraint", render: (r: ConstraintRow) => <span className="font-medium text-primary">{r.constraint}</span> },
-                { header: `${selectedPort.name} Limit`, align: "right", render: (r: ConstraintRow) => <span className="text-secondary">{r.limit} {r.unit}</span> },
-                { header: "Required", align: "right", render: (r: ConstraintRow) => <span className="text-secondary">{r.required} {r.unit}</span> },
-                ...analysis.vessels.map(
-                  (v): Column<ConstraintRow> => ({
-                    header: v.type,
-                    render: (r: ConstraintRow) => {
-                      const spec = VESSEL_SPECS[v.type];
-                      const status = compliance(spec, r.constraint, portConstraints);
-                      return (
-                        <StatusBadge
-                          status={status}
-                          tone={status === "Pass" ? "green" : status === "Restricted" ? "amber" : "red"}
-                        />
-                      );
-                    },
-                  })
-                ),
-              ]}
-              data={constraintRows}
-              rowKey={(r) => r.constraint}
-            />
-            <p className="mt-3 text-[11px] leading-relaxed text-secondary">
-              {selected?.portCompatibility === "Pass"
-                ? `${selected.type} clears all limits with a ${selected.score}/100 composite score and is the recommended charter pick.`
-                : `${selected?.type} may be restricted at ${selectedPort.name} — check constraint details above.`}
-            </p>
+            <DataTable columns={checkColumns} data={port.selected.checks} rowKey={(c) => c.name} />
           </ChartCard>
         </div>
 
         <div className="flex flex-col gap-4">
-          <ChartCard title="Selected Charter" subtitle={selected ? `${selected.type} \u00B7 ${selected.dwt}` : ""}>
-            {selected ? (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between rounded-lg border border-line bg-panel p-3">
-                  <span className="text-[12px] text-secondary">Recommended score</span>
-                  <span className="text-[15px] font-semibold text-primary">{selected.score}/100</span>
-                </div>
-                <div className="space-y-2 text-[12px]">
-                  <div className="flex justify-between"><span className="text-secondary">Charter cost</span><span className="text-primary">${selected.costPerDay.toLocaleString()}/day</span></div>
-                  <div className="flex justify-between"><span className="text-secondary">Est. per voyage</span><span className="text-primary">${Math.round(selected.costPerDay * 18).toLocaleString()}</span></div>
-                  <div className="flex justify-between"><span className="text-secondary">{selectedPort.name} compatibility</span><StatusBadge status={selected.portCompatibility} tone={selected.portCompatibility === "Pass" ? "green" : "amber"} /></div>
-                  <div className="flex justify-between"><span className="text-secondary">Cargo fit</span><span className="text-primary">{VESSEL_SPECS[selected.type].cargo.toLocaleString()} t \u2713</span></div>
-                </div>
+          <ChartCard
+            title="Selected Charter"
+            subtitle={`${selected.type} · ${selected.dwtLabel}`}
+          >
+            <div className="space-y-3">
+              <div className="flex items-center justify-between rounded-lg border border-line bg-panel p-3">
+                <span className="text-[12px] text-secondary">Recommendation score</span>
+                <span className="text-[15px] font-semibold text-primary">{selected.score}/100</span>
               </div>
-            ) : (
-              <p className="text-[12px] text-secondary">Select a vessel to inspect charter detail.</p>
+              <div className="space-y-2 text-[12px]">
+                <Row label="Implied rate" value={`${formatUSD(selected.impliedDailyRate)}/day`} />
+                <Row label="Reference daily rate" value={`${formatUSD(selected.costPerDay)}/day`} />
+                <Row label="Payload" value={`${formatNumber(selected.payload)} t`} />
+                <Row
+                  label="Parcel lift"
+                  value={`${formatNumber(selected.utilisationTonnes)} t (${selected.utilisationPercent}%)`}
+                />
+                <Row
+                  label="Draft margin"
+                  value={`${selected.draftMargin >= 0 ? "+" : ""}${selected.draftMargin} m`}
+                />
+                <Row
+                  label="LOA margin"
+                  value={`${selected.loaMargin >= 0 ? "+" : ""}${selected.loaMargin} m`}
+                />
+                <Row
+                  label="Beam margin"
+                  value={`${selected.beamMargin >= 0 ? "+" : ""}${selected.beamMargin} m`}
+                />
+              </div>
+              <div className="border-t border-line pt-3">
+                <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-secondary">
+                  <Anchor className="size-3.5" /> Cost implication
+                </div>
+                <p className="text-[12px] leading-relaxed text-primary">{selected.costImplication}</p>
+              </div>
+            </div>
+          </ChartCard>
+
+          <ChartCard title="Why This Class" subtitle="Engine reasoning, verbatim">
+            <ul className="space-y-1.5">
+              {selected.reasons.map((r) => (
+                <li key={r} className="text-[12px] leading-relaxed text-secondary">
+                  · {r}
+                </li>
+              ))}
+            </ul>
+            {selected.blockers.length > 0 && (
+              <div className="mt-3 border-t border-line pt-3">
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-bad">
+                  Blockers
+                </div>
+                <ul className="space-y-1.5">
+                  {selected.blockers.map((b) => (
+                    <li key={b} className="text-[12px] leading-relaxed text-bad">
+                      · {b}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </ChartCard>
 
           <div className="flex items-start gap-3 rounded-xl border border-line bg-panel p-3.5 text-[11.5px] leading-relaxed text-secondary">
             <Waves className="mt-0.5 size-4 shrink-0 text-accent" />
             <p>
-              Port compatibility screens 4 constraints: draft, LOA, beam and cargo-handling rate.
-              Winter draft restrictions can bind during post-monsoon — flagged in the Risk Center.
+              Draft, LOA and beam are treated as hard limits — failing any one means the vessel cannot berth.
+              Cargo handling is a soft constraint: a slow rate costs working days and demurrage, not access.
+              A parcel larger than the hull payload is shown as multiple voyages with the added waiting and
+              stevedoring exposure priced in, rather than being silently rounded away.
             </p>
           </div>
         </div>
       </div>
 
       <div className="mt-4">
-        <ChartCard title="Vessel Comparison" subtitle="Side-by-side cost, availability and score">
-          <DataTable columns={columns} data={analysis.vessels} rowKey={(v) => v.type} />
+        <ChartCard title="Vessel Comparison" subtitle="Payload, parcel fit, cost, availability and score">
+          <DataTable columns={columns} data={vessel.all} rowKey={(v) => v.type} />
         </ChartCard>
       </div>
+
+      <p className="mt-4 rounded-xl border border-line bg-panel p-3 text-[11px] leading-relaxed text-secondary">
+        Vessel specifications ({Object.keys(VESSEL_REFERENCE).join(", ")}) come from the reference layer, not from
+        live class indices. Implied rates are the model&apos;s forecast for this class on this corridor.
+      </p>
+    </div>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-secondary">{label}</span>
+      <span className="text-primary">{value}</span>
     </div>
   );
 }

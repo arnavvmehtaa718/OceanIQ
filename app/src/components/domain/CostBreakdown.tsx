@@ -1,6 +1,6 @@
 "use client";
 
-import { formatUSD } from "@/lib/calculations";
+import { formatUSD } from "@/lib/format";
 
 export interface BreakdownItem {
   key: string;
