@@ -1,353 +1,700 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
-import { MapPin, Ship } from "lucide-react";
-import type { Map as LeafletMap, TileLayer } from "leaflet";
-import { useAppStore } from "@/store/useAppStore";
-import {
-  DEFAULT_DESTINATION,
-  DEFAULT_ORIGIN,
-  PORT_COORDS,
-  type PortCoord,
-} from "@/lib/portCoordinates";
+/**
+ * OceanIQ — Route Optimization map.
+ *
+ * A real geographic Leaflet map: OpenStreetMap basemap tiles, pan/zoom,
+ * fit-to-route, live origin/destination markers, the great-circle corridor the
+ * route engine produced (densified with the same `gcInterpolate` the engine
+ * uses) and a simulated vessel running the passage on a requestAnimationFrame
+ * loop.
+ *
+ * Every geographic input comes from the central `AnalysisResult`: corridor
+ * `coordinates`, distance, transit time and risk are read straight off
+ * `RouteOption`, so changing the procurement scenario and re-running the
+ * analysis redraws the whole map. No coordinates are invented here.
+ */
 
-const TILE_ATTRIB =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
+import "leaflet/dist/leaflet.css";
 
-function tileUrl(theme: "dark" | "light"): string {
-  return theme === "dark"
-    ? "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
-    : "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Crosshair, Layers, Loader2, Ship, TriangleAlert } from "lucide-react";
+import type * as Leaflet from "leaflet";
+import { gcInterpolate, greatCircleNm } from "@/lib/reference/corridors";
+import type { VesselClass } from "@/lib/reference/corridors";
+import type { RouteOption } from "@/lib/types";
+import { formatNumber, formatUSD } from "@/lib/format";
+
+type LatLng = [number, number];
+
+interface RouteGeometry {
+  /** Drawable pieces, split wherever the corridor would cross the antimeridian. */
+  segments: LatLng[][];
+  /** Unbroken coordinate list, used for distances and the vessel animation. */
+  continuous: LatLng[];
+  /** Cumulative nautical miles from the origin, parallel to `continuous`. */
+  cumulativeNm: number[];
+  totalNm: number;
 }
 
-// ------------------------------------------------------------
-// Geographic helpers (pure math, safe on server)
-// ------------------------------------------------------------
+const OSM_ATTRIB =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const CARTO_ATTRIB = `${OSM_ATTRIB} &copy; <a href="https://carto.com/attributions">CARTO</a>`;
 
-function toRad(d: number): number {
-  return (d * Math.PI) / 180;
+interface BasemapDef {
+  key: string;
+  label: string;
+  url: string;
+  attribution: string;
+  maxZoom: number;
 }
-function toDeg(r: number): number {
-  return (r * 180) / Math.PI;
+
+/** Every option below is OpenStreetMap-derived, so the basemap is real geography. */
+const BASEMAPS: BasemapDef[] = [
+  {
+    key: "standard",
+    label: "OSM",
+    url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    attribution: OSM_ATTRIB,
+    maxZoom: 19,
+  },
+];
+
+const RISK_COLOR: Record<string, string> = {
+  Low: "#10b981",
+  Medium: "#f59e0b",
+  High: "#ef4444",
+};
+
+const DENSIFY_STEPS = 48;
+const VOYAGE_MS = 16000;
+const FIT_MAX_ZOOM = 7;
+const FIT_PADDING: [number, number] = [72, 72];
+
+function wrapLng(lng: number): number {
+  return ((((lng + 180) % 360) + 360) % 360) - 180;
 }
 
-/** Smooth interpolation along the great circle between two ports. */
-function gcInterpolate(a: PortCoord, b: PortCoord, t: number): PortCoord {
-  const phi1 = toRad(a.lat);
-  const lambda1 = toRad(a.lng);
-  const phi2 = toRad(b.lat);
-  const lambda2 = toRad(b.lng);
-  const sinP1 = Math.sin(phi1);
-  const cosP1 = Math.cos(phi1);
-  const sinP2 = Math.sin(phi2);
-  const cosP2 = Math.cos(phi2);
+function densifyLeg(a: LatLng, b: LatLng): LatLng[] {
+  let delta = b[1] - a[1];
+  if (delta > 180) delta -= 360;
+  else if (delta < -180) delta += 360;
+  const from = { lat: a[0], lng: a[1] };
+  const to = { lat: b[0], lng: a[1] + delta };
+  const out: LatLng[] = [];
+  for (let i = 0; i <= DENSIFY_STEPS; i += 1) {
+    const p = gcInterpolate(from, to, i / DENSIFY_STEPS);
+    out.push([p.lat, p.lng]);
+  }
+  return out;
+}
 
-  const cosDelta = sinP1 * sinP2 + cosP1 * cosP2 * Math.cos(lambda2 - lambda1);
-  const delta = Math.acos(Math.min(1, Math.max(-1, cosDelta)));
-  if (delta < 1e-9) return a;
+function buildGeometry(coordinates: { lat: number; lng: number }[]): RouteGeometry {
+  const continuous: LatLng[] = [];
+  for (let i = 0; i < coordinates.length - 1; i += 1) {
+    const leg = densifyLeg(
+      [coordinates[i].lat, coordinates[i].lng],
+      [coordinates[i + 1].lat, coordinates[i + 1].lng],
+    );
+    for (let j = i === 0 ? 0 : 1; j < leg.length; j += 1) continuous.push(leg[j]);
+  }
+  if (continuous.length === 0 && coordinates.length > 0) {
+    continuous.push([coordinates[0].lat, coordinates[0].lng]);
+  }
 
-  const sinDelta = Math.sin(delta);
-  const A = Math.sin((1 - t) * delta) / sinDelta;
-  const B = Math.sin(t * delta) / sinDelta;
+  const segments: LatLng[][] = [];
+  let current: LatLng[] = [];
+  for (const [lat, lng] of continuous) {
+    const normalised = wrapLng(lng);
+    const previous = current[current.length - 1];
+    if (previous && Math.abs(normalised - previous[1]) > 180) {
+      if (current.length > 1) segments.push(current);
+      current = [];
+    }
+    current.push([lat, normalised]);
+  }
+  if (current.length > 1) segments.push(current);
 
-  const x = A * cosP1 * Math.cos(lambda1) + B * cosP2 * Math.cos(lambda2);
-  const y = A * cosP1 * Math.sin(lambda1) + B * cosP2 * Math.sin(lambda2);
-  const z = A * sinP1 + B * sinP2;
+  const cumulativeNm: number[] = [0];
+  let totalNm = 0;
+  for (let i = 1; i < continuous.length; i += 1) {
+    totalNm += greatCircleNm(
+      { lat: continuous[i - 1][0], lng: continuous[i - 1][1] },
+      { lat: continuous[i][0], lng: continuous[i][1] },
+    );
+    cumulativeNm.push(totalNm);
+  }
 
+  return { segments, continuous, cumulativeNm, totalNm };
+}
+
+function pointAtNm(
+  geometry: RouteGeometry,
+  distanceNm: number,
+): { lat: number; lng: number; course: number } {
+  const { continuous, cumulativeNm, totalNm } = geometry;
+  if (continuous.length < 2) {
+    const only = continuous[0] ?? ([0, 0] as LatLng);
+    return { lat: only[0], lng: wrapLng(only[1]), course: 0 };
+  }
+  const d = Math.min(Math.max(distanceNm, 0), totalNm);
+  let i = 1;
+  while (i < cumulativeNm.length - 1 && cumulativeNm[i] < d) i += 1;
+  const span = cumulativeNm[i] - cumulativeNm[i - 1];
+  const t = span > 0 ? (d - cumulativeNm[i - 1]) / span : 0;
+  const a = continuous[i - 1];
+  const b = continuous[i];
   return {
-    lat: toDeg(Math.atan2(z, Math.sqrt(x * x + y * y))),
-    lng: toDeg(Math.atan2(y, x)),
+    lat: a[0] + (b[0] - a[0]) * t,
+    lng: wrapLng(a[1] + (b[1] - a[1]) * t),
+    course: (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI,
   };
 }
 
-interface SweptPoint {
-  x: number;
-  y: number;
+function portIcon(L: typeof Leaflet, kind: "origin" | "discharge"): Leaflet.DivIcon {
+  const ring = kind === "origin" ? "#3b82f6" : "#f59e0b";
+  return L.divIcon({
+    className: "ociq-map-icon",
+    html: `<span class="ociq-pin" style="--ociq-pin:${ring}"><span class="ociq-pin__pulse"></span><span class="ociq-pin__core"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="3"/></svg></span></span>`,
+    iconSize: [34, 34],
+    iconAnchor: [17, 17],
+  });
 }
 
-function fmt(n: number): string {
-  return n.toFixed(1);
+function vesselIcon(L: typeof Leaflet): Leaflet.DivIcon {
+  return L.divIcon({
+    className: "ociq-map-icon",
+    html:
+      '<span class="ociq-vessel"><span class="ociq-vessel__ring"></span>' +
+      '<svg class="ociq-vessel__arrow" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.2 19.2 20.6 12 16.7 4.8 20.6Z"/></svg></span>',
+    iconSize: [38, 38],
+    iconAnchor: [19, 19],
+  });
 }
 
-/** Catmull-Rom to cubic-Bezier smooth path through projected route points. */
-function smoothPathD(pts: SweptPoint[]): string {
-  if (pts.length < 2) return "";
-  const ps = [pts[0], pts[0], ...pts, pts[pts.length - 1]];
-  let d = `M ${fmt(pts[0].x)} ${fmt(pts[0].y)}`;
-  for (let i = 1; i < ps.length - 2; i++) {
-    const p0 = ps[i - 1];
-    const p1 = ps[i];
-    const p2 = ps[i + 1];
-    const p3 = ps[i + 2];
-    const c1x = p1.x + (p2.x - p0.x) / 6;
-    const c1y = p1.y + (p2.y - p0.y) / 6;
-    const c2x = p2.x - (p3.x - p1.x) / 6;
-    const c2y = p2.y - (p3.y - p1.y) / 6;
-    d += ` C ${fmt(c1x)} ${fmt(c1y)}, ${fmt(c2x)} ${fmt(c2y)}, ${fmt(p2.x)} ${fmt(p2.y)}`;
-  }
-  return d;
+function waypointIcon(L: typeof Leaflet): Leaflet.DivIcon {
+  return L.divIcon({
+    className: "ociq-map-icon",
+    html: '<span class="ociq-waypoint"></span>',
+    iconSize: [12, 12],
+    iconAnchor: [6, 6],
+  });
 }
 
-function positionChip(el: HTMLDivElement | null, x: number, y: number) {
-  if (!el) return;
-  el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`;
-  el.style.visibility = "visible";
-}
-
-// ------------------------------------------------------------
-// Component
-// ------------------------------------------------------------
-
-interface RouteVisualizationProps {
-  origin: string;
-  destination: string;
-  distance: number;
-  duration: number;
-  risk: string;
+export interface RouteVisualizationProps {
+  /** The awarded corridor straight off `AnalysisResult.route.selected`. */
+  selected: RouteOption;
+  /** The screened alternatives, drawn as muted context corridors. */
+  alternatives: RouteOption[];
+  vesselType: VesselClass;
 }
 
 export default function RouteVisualization({
-  origin,
-  destination,
-  distance,
-  duration,
-  risk,
+  selected,
+  alternatives,
+  vesselType,
 }: RouteVisualizationProps) {
-  const theme = useAppStore((s) => s.theme);
+  const [basemap, setBasemap] = useState(BASEMAPS[0].key);
+  const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState(false);
 
-  const mapElRef = useRef<HTMLDivElement>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const svgRef = useRef<SVGSVGElement>(null);
-  const basePathRef = useRef<SVGPathElement>(null);
-  const overlayPathRef = useRef<SVGPathElement>(null);
-  const shipRef = useRef<HTMLDivElement>(null);
-  const originRef = useRef<HTMLDivElement>(null);
-  const destRef = useRef<HTMLDivElement>(null);
+  const hostRef = useRef<HTMLDivElement>(null);
+  const leafletRef = useRef<typeof Leaflet | null>(null);
+  const mapRef = useRef<Leaflet.Map | null>(null);
+  const tilesRef = useRef<Record<string, Leaflet.TileLayer>>({});
+  const overlaysRef = useRef<Leaflet.LayerGroup | null>(null);
+  const vesselArrowRef = useRef<SVGElement | null>(null);
+  const readoutRef = useRef<HTMLSpanElement>(null);
+  const rafRef = useRef<number | null>(null);
 
-  const mapRef = useRef<LeafletMap | null>(null);
-  const tileRef = useRef<TileLayer | null>(null);
+  const geometry = useMemo(() => buildGeometry(selected.coordinates), [selected.coordinates]);
+  const screened = useMemo(
+    () =>
+      alternatives
+        .filter((r) => !r.recommended && r.coordinates.length > 1)
+        .map((r) => ({ route: r, geometry: buildGeometry(r.coordinates) })),
+    [alternatives],
+  );
 
-  // Re-project route / markers onto the live map whenever input changes.
-  const syncRef = useRef<() => void>(() => {});
-  const sync = useCallback(() => {
+  const riskColor = RISK_COLOR[selected.riskLevel] ?? RISK_COLOR.Medium;
+  const totalDays = Math.max(1, Math.round(selected.duration));
+
+  const fitRoute = useCallback(() => {
+    const L = leafletRef.current;
     const map = mapRef.current;
-    const wrap = wrapRef.current;
-    if (!map || !wrap) return;
-
-    const start = PORT_COORDS[origin] ?? PORT_COORDS[DEFAULT_ORIGIN];
-    const end = PORT_COORDS[destination] ?? PORT_COORDS[DEFAULT_DESTINATION];
-    const bounds: [[number, number], [number, number]] = [
-      [start.lat, start.lng],
-      [end.lat, end.lng],
-    ];
-
-    map.fitBounds(bounds, {
-      paddingTopLeft: [34, 30],
-      paddingBottomRight: [34, 30],
-      animate: false,
+    if (!L || !map || geometry.continuous.length < 2) return;
+    map.invalidateSize({ animate: false });
+    map.fitBounds(L.latLngBounds(geometry.continuous as unknown as Leaflet.LatLngExpression[]), {
+      padding: FIT_PADDING,
+      maxZoom: FIT_MAX_ZOOM,
+      animate: true,
+      duration: 0.7,
     });
+  }, [geometry]);
 
-    const w = wrap.clientWidth || 680;
-    const h = wrap.clientHeight || 260;
-
-    const SEGMENTS = 10;
-    const pts: SweptPoint[] = [];
-    for (let i = 0; i <= SEGMENTS; i++) {
-      const p = gcInterpolate(start, end, i / SEGMENTS);
-      pts.push(map.latLngToContainerPoint([p.lat, p.lng]));
+  const changeBasemap = useCallback((key: string) => {
+    const map = mapRef.current;
+    if (!map) return;
+    for (const [id, layer] of Object.entries(tilesRef.current)) {
+      if (id === key) {
+        if (map.hasLayer(layer)) layer.bringToBack();
+        else layer.addTo(map);
+      } else if (map.hasLayer(layer)) {
+        map.removeLayer(layer);
+      }
     }
-    const path = smoothPathD(pts);
+    setBasemap(key);
+  }, []);
 
-    svgRef.current?.setAttribute("viewBox", `0 0 ${w} ${h}`);
-    basePathRef.current?.setAttribute("d", path);
-    overlayPathRef.current?.setAttribute("d", path);
-
-    if (shipRef.current) {
-      shipRef.current.style.offsetPath = `path("${path}")`;
-      shipRef.current.style.visibility = "visible";
-      // Restart the offset animation so the vessel always departs from origin.
-      shipRef.current.style.animation = "none";
-      void shipRef.current.offsetWidth;
-      shipRef.current.style.animation = "route-dot 7s linear infinite";
-    }
-
-    const p0 = map.latLngToContainerPoint([start.lat, start.lng]);
-    const pN = map.latLngToContainerPoint([end.lat, end.lng]);
-    positionChip(originRef.current, p0.x, p0.y);
-    positionChip(destRef.current, pN.x, pN.y);
-  }, [origin, destination]);
-
-  // Create the Leaflet map once, client-side only.
+  // Map lifecycle: created once, client-side only, torn down on unmount.
   useEffect(() => {
     let disposed = false;
 
     (async () => {
       const L = await import("leaflet");
-      await import("leaflet/dist/leaflet.css");
-      if (disposed || !mapElRef.current) return;
+      if (disposed || !hostRef.current) return;
 
-      const map = L.map(mapElRef.current, {
+      const map = L.map(hostRef.current, {
         zoomControl: false,
         attributionControl: true,
-        dragging: false,
-        touchZoom: false,
-        scrollWheelZoom: false,
-        doubleClickZoom: false,
-        boxZoom: false,
-        keyboard: false,
+        worldCopyJump: true,
+        minZoom: 2,
+        maxZoom: 19,
+        zoomSnap: 0.5,
+        wheelPxPerZoomLevel: 90,
       });
+
+      for (const def of BASEMAPS) {
+        tilesRef.current[def.key] = L.tileLayer(def.url, {
+          attribution: def.attribution,
+          maxZoom: def.maxZoom,
+          minZoom: 1,
+        });
+      }
+      tilesRef.current[BASEMAPS[0].key].addTo(map);
+
       map.attributionControl.setPrefix(false);
+      L.control.zoom({ position: "bottomright" }).addTo(map);
 
-      const tile = L.tileLayer(tileUrl(theme), {
-        attribution: TILE_ATTRIB,
-        maxZoom: 18,
-        minZoom: 1,
-      }).addTo(map);
-
+      leafletRef.current = L;
       mapRef.current = map;
-      tileRef.current = tile;
-
-      syncRef.current();
-    })();
+      overlaysRef.current = L.layerGroup().addTo(map);
+      setReady(true);
+    })().catch(() => {
+      if (!disposed) setFailed(true);
+    });
 
     return () => {
       disposed = true;
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      overlaysRef.current?.clearLayers();
+      overlaysRef.current = null;
+      vesselArrowRef.current = null;
+      tilesRef.current = {};
+      leafletRef.current = null;
       if (mapRef.current) {
         mapRef.current.remove();
         mapRef.current = null;
       }
-      tileRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Keep the latest sync routine in a ref and re-run it whenever the ports change.
+  // Wheel zoom engages only once the operator interacts, so scrolling past the
+  // card is never hijacked.
   useEffect(() => {
-    syncRef.current = sync;
-    syncRef.current();
-  }, [sync]);
+    const map = mapRef.current;
+    const host = hostRef.current;
+    if (!map || !host) return;
+    const engage = () => map.scrollWheelZoom.enable();
+    const release = () => map.scrollWheelZoom.disable();
+    host.addEventListener("click", engage);
+    host.addEventListener("mouseenter", engage);
+    host.addEventListener("mouseleave", release);
+    return () => {
+      host.removeEventListener("click", engage);
+      host.removeEventListener("mouseenter", engage);
+      host.removeEventListener("mouseleave", release);
+      map.scrollWheelZoom.disable();
+    };
+  }, [ready]);
 
-  // Swap basemap tiles when the theme changes.
   useEffect(() => {
-    tileRef.current?.setUrl(tileUrl(theme));
-  }, [theme]);
-
-  // Keep the projected overlay aligned while the card resizes.
-  useEffect(() => {
-    const wrap = wrapRef.current;
-    if (!wrap) return;
-    const ro = new ResizeObserver(() => {
-      mapRef.current?.invalidateSize();
-      syncRef.current();
-    });
-    ro.observe(wrap);
-    return () => ro.disconnect();
+    const host = hostRef.current;
+    if (!host) return;
+    const observer = new ResizeObserver(() => mapRef.current?.invalidateSize({ animate: false }));
+    observer.observe(host);
+    return () => observer.disconnect();
   }, []);
+
+  // Draw the corridor, markers and the simulated vessel for the current result.
+  useEffect(() => {
+    let disposed = false;
+
+    (async () => {
+      const L = leafletRef.current;
+      const map = mapRef.current;
+      const overlays = overlaysRef.current;
+      if (!L || !map || !overlays) return;
+
+      const origin = geometry.continuous[0];
+      const discharge = geometry.continuous[geometry.continuous.length - 1];
+      if (!origin || !discharge) return;
+
+      overlays.clearLayers();
+
+      const asLatLng = (seg: LatLng[]) => seg as unknown as Leaflet.LatLngExpression[];
+      const bounds = L.latLngBounds(geometry.continuous as unknown as Leaflet.LatLngExpression[]);
+
+      geometry.segments.forEach((seg) => {
+        L.polyline(asLatLng(seg), {
+          className: "ociq-route-halo",
+          color: riskColor,
+          weight: 12,
+          opacity: 0.18,
+          lineCap: "round",
+          lineJoin: "round",
+          interactive: false,
+        }).addTo(overlays);
+        L.polyline(asLatLng(seg), {
+          className: "ociq-route-casing",
+          color: "#06101f",
+          weight: 7,
+          opacity: 0.9,
+          lineCap: "round",
+          lineJoin: "round",
+          interactive: false,
+        }).addTo(overlays);
+        L.polyline(asLatLng(seg), {
+          className: "ociq-route-flow",
+          color: "#60a5fa",
+          weight: 3,
+          opacity: 1,
+          lineCap: "round",
+          lineJoin: "round",
+          interactive: false,
+        }).addTo(overlays);
+      });
+
+      for (const { route, geometry: alt } of screened) {
+        alt.segments.forEach((seg) => {
+          L.polyline(asLatLng(seg), {
+            className: "ociq-route-alt",
+            color: "#94a3b8",
+            weight: 2,
+            opacity: 0.55,
+            dashArray: "5 7",
+            interactive: true,
+          })
+            .addTo(overlays)
+            .bindTooltip(
+              `${route.name} &middot; ${route.label}<br/>${formatNumber(route.distance)} nm &middot; ${
+                route.duration
+              } days &middot; risk ${route.riskScore}`,
+              { className: "ociq-tip", sticky: true, direction: "top", opacity: 1 },
+            );
+        });
+        const mid = alt.continuous[Math.floor(alt.continuous.length / 2)];
+        if (mid) {
+          L.marker([mid[0], mid[1]], { icon: waypointIcon(L), interactive: false, keyboard: false })
+            .addTo(overlays)
+            .bindTooltip(`${route.name} routing waypoint`, {
+              className: "ociq-tip",
+              direction: "top",
+              opacity: 1,
+            });
+        }
+      }
+
+      L.marker([origin[0], wrapLng(origin[1])], {
+        icon: portIcon(L, "origin"),
+        keyboard: false,
+        zIndexOffset: 500,
+      })
+        .addTo(overlays)
+        .bindTooltip(
+          `<strong>Loading port</strong><br/>${selected.loadingPort}<br/>${origin[0].toFixed(
+            4,
+          )}, ${wrapLng(origin[1]).toFixed(4)}`,
+          { className: "ociq-tip", direction: "top", opacity: 1, offset: [0, -16] },
+        );
+
+      L.marker([discharge[0], wrapLng(discharge[1])], {
+        icon: portIcon(L, "discharge"),
+        keyboard: false,
+        zIndexOffset: 500,
+      })
+        .addTo(overlays)
+        .bindTooltip(
+          `<strong>Discharge port</strong><br/>${selected.dischargePort}<br/>${discharge[0].toFixed(
+            4,
+          )}, ${wrapLng(discharge[1]).toFixed(4)}`,
+          { className: "ociq-tip", direction: "top", opacity: 1, offset: [0, -16] },
+        );
+
+      const vessel = L.marker([origin[0], wrapLng(origin[1])], {
+        icon: vesselIcon(L),
+        keyboard: false,
+        zIndexOffset: 1000,
+      }).addTo(overlays);
+      vesselArrowRef.current = vessel
+        .getElement()
+        ?.querySelector<SVGElement>(".ociq-vessel__arrow") ?? null;
+
+      map.fitBounds(bounds, {
+        padding: FIT_PADDING,
+        maxZoom: FIT_MAX_ZOOM,
+        animate: false,
+      });
+
+      const reduced =
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+      if (reduced) {
+        const mid = pointAtNm(geometry, geometry.totalNm / 2);
+        vessel.setLatLng([mid.lat, mid.lng]);
+        if (readoutRef.current) {
+          readoutRef.current.textContent = `Mid-passage · day ${Math.ceil(totalDays / 2)} of ${totalDays}`;
+        }
+        return;
+      }
+
+      const started = performance.now();
+      const tick = (now: number) => {
+        if (disposed || !mapRef.current) return;
+        const progress = ((now - started) % VOYAGE_MS) / VOYAGE_MS;
+        const pos = pointAtNm(geometry, progress * geometry.totalNm);
+        vessel.setLatLng([pos.lat, pos.lng]);
+        if (vesselArrowRef.current) {
+          vesselArrowRef.current.style.transform = `rotate(${pos.course.toFixed(1)}deg)`;
+        }
+        if (readoutRef.current) {
+          readoutRef.current.textContent = `Day ${Math.min(
+            totalDays,
+            Math.floor(progress * totalDays) + 1,
+          )} of ${totalDays}`;
+        }
+        rafRef.current = window.requestAnimationFrame(tick);
+      };
+      rafRef.current = window.requestAnimationFrame(tick);
+    })();
+
+    return () => {
+      disposed = true;
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      vesselArrowRef.current = null;
+      overlaysRef.current?.clearLayers();
+    };
+  }, [
+    geometry,
+    screened,
+    riskColor,
+    totalDays,
+    selected.loadingPort,
+    selected.dischargePort,
+    ready,
+  ]);
+
+  const showAlternatives = screened.length > 0;
 
   return (
-    <div className="relative w-full overflow-hidden rounded-xl border border-line bg-navy">
+    <div className="relative w-full overflow-hidden rounded-xl border border-line bg-panel">
       <style>{`
-        @keyframes route-pulse {
-          0% { stroke-dashoffset: 0; }
-          100% { stroke-dashoffset: -340; }
+        .ociq-map-shell { position: relative; height: 380px; }
+        @media (min-width: 768px) { .ociq-map-shell { height: 460px; } }
+        .ociq-map-shell .leaflet-container {
+          height: 100%; width: 100%; background: #0a0e1a; font: inherit; outline: none;
         }
-        @keyframes route-dot {
-          0% { offset-distance: 0%; }
-          100% { offset-distance: 100%; }
+        .ociq-map-icon { background: none !important; border: none !important; }
+
+        .ociq-route-flow { stroke-dasharray: 11 9; animation: oceaniq-route-flow 2.2s linear infinite; }
+        @keyframes oceaniq-route-flow { to { stroke-dashoffset: -40; } }
+
+        .ociq-pin { position: relative; display: grid; place-items: center; width: 34px; height: 34px; }
+        .ociq-pin__core {
+          position: relative; z-index: 2; display: grid; place-items: center;
+          width: 20px; height: 20px; border-radius: 999px;
+          background: var(--ociq-pin); color: #06101f;
+          border: 2px solid rgba(255,255,255,0.92);
+          box-shadow: 0 2px 8px rgba(0,0,0,0.55);
         }
+        .ociq-pin__core svg { width: 11px; height: 11px; }
+        .ociq-pin__pulse {
+          position: absolute; inset: 3px; border-radius: 999px;
+          background: var(--ociq-pin); opacity: 0.45;
+          animation: oceaniq-pin-pulse 2.6s ease-out infinite;
+        }
+        @keyframes oceaniq-pin-pulse {
+          0% { transform: scale(0.6); opacity: 0.6; }
+          70% { transform: scale(2.6); opacity: 0; }
+          100% { transform: scale(2.6); opacity: 0; }
+        }
+
+        .ociq-vessel { position: relative; display: grid; place-items: center; width: 38px; height: 38px; }
+        .ociq-vessel__ring {
+          position: absolute; inset: 0; border-radius: 999px;
+          background: rgba(16,185,129,0.22); border: 1px solid rgba(16,185,129,0.6);
+          animation: oceaniq-vessel-halo 1.8s ease-out infinite;
+        }
+        @keyframes oceaniq-vessel-halo {
+          0% { transform: scale(0.55); opacity: 0.85; }
+          100% { transform: scale(1.35); opacity: 0; }
+        }
+        .ociq-vessel__arrow {
+          position: relative; z-index: 2; width: 22px; height: 22px; color: #10b981;
+          filter: drop-shadow(0 1px 3px rgba(0,0,0,0.75)); transition: transform 120ms linear;
+        }
+
+        .ociq-waypoint {
+          display: block; width: 9px; height: 9px; transform: rotate(45deg);
+          background: #cbd5e1; border: 1px solid #06101f;
+        }
+
+        .ociq-tip {
+          background: rgba(10,14,26,0.94) !important; border: 1px solid #1e2a3d !important;
+          border-radius: 8px !important; color: #f0f4ff !important; font-size: 11px !important;
+          line-height: 1.5 !important; padding: 6px 9px !important;
+          box-shadow: 0 8px 22px rgba(0,0,0,0.5) !important;
+        }
+        .ociq-tip::before { border-top-color: #1e2a3d !important; }
+
+        .ociq-map-shell .leaflet-control-zoom a,
+        .ociq-map-shell .leaflet-control-zoom a:hover {
+          background: rgba(10,14,26,0.9) !important; color: #f0f4ff !important;
+          border-color: #1e2a3d !important;
+        }
+        .ociq-map-shell .leaflet-control-zoom { border: none !important; box-shadow: none !important; }
+        .ociq-map-shell .leaflet-control-zoom a {
+          width: 26px !important; height: 26px !important; line-height: 26px !important;
+        }
+        .ociq-map-shell .leaflet-control-attribution {
+          background: rgba(10,14,26,0.72) !important; color: #8899bb !important;
+          font-size: 9.5px !important; padding: 1px 6px !important;
+        }
+        .ociq-map-shell .leaflet-control-attribution a { color: #3b82f6 !important; }
       `}</style>
 
-      {/* Real geographic basemap (CARTO/OSM tiles) */}
-      <div ref={mapElRef} className="absolute inset-0 z-0" aria-hidden="true" />
+      <div
+        ref={hostRef}
+        className="ociq-map-shell"
+        role="img"
+        aria-label={`Geographic route map from ${selected.loadingPort} to ${selected.dischargePort}: ${formatNumber(
+          selected.distance,
+        )} nautical miles, ${selected.duration} days transit, operational risk ${selected.riskLevel}.`}
+      />
 
-      {/* Existing animated corridor overlay, projected onto the live map */}
-      <div ref={wrapRef} className="relative z-10 h-[260px] w-full pointer-events-none">
-        <svg
-          ref={svgRef}
-          viewBox="0 0 680 260"
-          preserveAspectRatio="none"
-          className="absolute inset-0 h-full w-full"
-        >
-          <defs>
-            <linearGradient id="routeGrad" x1="0" y1="0" x2="1" y2="0">
-              <stop offset="0%" stopColor="#3b82f6" />
-              <stop offset="50%" stopColor="#10b981" />
-              <stop offset="100%" stopColor="#f59e0b" />
-            </linearGradient>
-          </defs>
-
-          {/* dashed base path */}
-          <path
-            ref={basePathRef}
-            d="M 70,190 C 220,90 400,230 610,120"
-            fill="none"
-            stroke="var(--color-line)"
-            strokeWidth={2}
-            strokeDasharray="6 6"
-          />
-          {/* animated dashed overlay */}
-          <path
-            ref={overlayPathRef}
-            d="M 70,190 C 220,90 400,230 610,120"
-            fill="none"
-            stroke="url(#routeGrad)"
-            strokeWidth={2.5}
-            strokeLinecap="round"
-            strokeDasharray="14 10"
-            style={{ animation: "route-pulse 4s linear infinite" }}
-          />
-        </svg>
-
-        {/* Traveling vessel */}
-        <div className="route-traveler absolute left-0 top-0" ref={shipRef} style={{ visibility: "hidden" }}>
-          <div className="flex h-8 w-14 items-center justify-center gap-0.5 rounded-lg border border-accent/40 bg-navy/90 shadow-lg shadow-blue-nav/30 backdrop-blur">
-            <Ship className="size-3.5 text-accent" />
-            <span className="text-[9px] font-semibold text-accent">{duration}d</span>
+      <div className="pointer-events-none absolute left-3 top-3 z-[500] max-w-[min(20rem,calc(100%-5rem))]">
+        <div className="rounded-lg border border-line bg-navy/88 px-3 py-2.5 backdrop-blur">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-accent">
+              {selected.label}
+            </span>
+            <span
+              className="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider"
+              style={{ background: `${riskColor}22`, color: riskColor }}
+            >
+              {selected.riskLevel} risk {selected.riskScore}
+            </span>
           </div>
-        </div>
-
-        {/* Status banner */}
-        <div className="absolute right-6 top-4 flex items-center gap-2 rounded-lg border border-line bg-navy/85 px-2.5 py-1.5 backdrop-blur">
-          <span className="text-[10px] text-secondary">{distance.toLocaleString()} nm</span>
-          <span className="text-line">·</span>
-          <span className="text-[10px] text-secondary">{duration} days</span>
-          <span className={`text-[10px] font-semibold ${
-            risk === "High" ? "text-bad" : risk === "Medium" ? "text-warn" : "text-good"
-          }`}>
-            {risk} risk
-          </span>
-        </div>
-
-        {/* Origin marker */}
-        <div
-          ref={originRef}
-          className="absolute left-0 top-0 z-20 flex items-center gap-2"
-          style={{ visibility: "hidden" }}
-        >
-          <span className="grid size-6 place-items-center rounded-full bg-accent/20 text-accent">
-            <MapPin className="size-3.5" />
-          </span>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-secondary">Origin</div>
-            <div className="text-[13px] font-semibold text-primary">{origin}</div>
+          <div className="mt-1 text-[13px] font-semibold text-primary">
+            {selected.loadingPort} <span className="text-secondary">&rarr;</span>{" "}
+            {selected.dischargePort}
           </div>
-        </div>
-
-        {/* Destination marker */}
-        <div
-          ref={destRef}
-          className="absolute left-0 top-0 z-20 flex flex-row-reverse items-center gap-2 text-right"
-          style={{ visibility: "hidden" }}
-        >
-          <span className="grid size-6 place-items-center rounded-full bg-warn/20 text-warn">
-            <MapPin className="size-3.5" />
-          </span>
-          <div>
-            <div className="text-[10px] uppercase tracking-wider text-secondary">Destination</div>
-            <div className="text-[13px] font-semibold text-primary">{destination}</div>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-secondary">
+            <span className="font-semibold text-primary">{formatNumber(selected.distance)} nm</span>
+            <span>
+              {selected.duration} days @ {selected.speedKnots} kn
+            </span>
+            <span>{formatUSD(selected.totalCost)}</span>
           </div>
         </div>
       </div>
+
+      <div className="absolute right-3 top-3 z-[500] flex flex-col items-end gap-1.5">
+        <div className="flex flex-col overflow-hidden rounded-lg border border-line bg-navy/88 backdrop-blur">
+          <span className="flex items-center gap-1 px-2 py-1 text-[9px] font-semibold uppercase tracking-wider text-secondary">
+            <Layers className="size-3" /> Base
+          </span>
+          {BASEMAPS.map((def) => (
+            <button
+              key={def.key}
+              type="button"
+              onClick={() => changeBasemap(def.key)}
+              aria-pressed={basemap === def.key}
+              className={`border-t border-line px-2.5 py-1 text-left text-[10.5px] font-medium transition-colors ${
+                basemap === def.key
+                  ? "bg-accent/20 text-accent"
+                  : "text-secondary hover:bg-white/5 hover:text-primary"
+              }`}
+            >
+              {def.label}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={fitRoute}
+          title="Fit route to view"
+          aria-label="Fit route to view"
+          className="grid size-8 place-items-center rounded-lg border border-line bg-navy/88 text-secondary backdrop-blur transition-colors hover:border-accent/50 hover:text-accent"
+        >
+          <Crosshair className="size-4" />
+        </button>
+      </div>
+
+      <div className="absolute bottom-6 left-3 z-[500] rounded-lg border border-line bg-navy/88 px-2.5 py-2 backdrop-blur">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-secondary">
+          <span className="flex items-center gap-1.5">
+            <span className="size-2 rounded-full bg-accent" /> Loading
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="size-2 rounded-full bg-warn" /> Discharge
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-0.5 w-4 rounded bg-accent" /> Selected corridor
+          </span>
+          {showAlternatives && (
+            <span className="flex items-center gap-1.5">
+              <span className="h-0 w-4 border-t border-dashed border-secondary" /> Screened alternative
+            </span>
+          )}
+          <span className="flex items-center gap-1.5">
+            <Ship className="size-3 text-good" /> Simulated vessel position
+          </span>
+        </div>
+        <div className="mt-1 flex items-center gap-2 text-[10px]">
+          <span ref={readoutRef} className="font-semibold text-good">
+            Day 1 of {totalDays}
+          </span>
+          <span className="text-secondary">{vesselType} &middot; simulated, not live AIS</span>
+        </div>
+      </div>
+
+      {!ready && !failed && (
+        <div className="absolute inset-0 z-[600] grid place-items-center bg-navy/70 text-[11.5px] text-secondary backdrop-blur-sm">
+          <span className="flex items-center gap-2">
+            <Loader2 className="size-4 animate-spin" /> Loading OpenStreetMap basemap&hellip;
+          </span>
+        </div>
+      )}
+
+      {failed && (
+        <div className="absolute inset-0 z-[600] grid place-items-center bg-navy/85 px-6 text-center">
+          <div>
+            <TriangleAlert className="mx-auto size-5 text-warn" />
+            <p className="mt-2 text-[12px] font-medium text-primary">Basemap unavailable</p>
+            <p className="mt-1 text-[11px] text-secondary">
+              The OpenStreetMap tile layer could not be loaded. Route metrics shown here remain current.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -11,9 +11,7 @@
 
 import { clamp, formatUSD, mapRange, riskLevelOf, round, round1 } from "./shared";
 import {
-  corridorDistanceNm,
   getLoadingPort,
-  transitDays,
   type VesselClass,
 } from "@/lib/reference/corridors";
 import { getPort, type PortReference } from "@/lib/reference/ports";
@@ -24,6 +22,7 @@ import type {
   RouteAssessment,
   RouteOption,
 } from "@/lib/types";
+import { getMaritimeRoute } from "@/lib/maritimeRoute";
 
 interface Variant {
   id: string;
@@ -91,27 +90,26 @@ export interface RouteEvaluationInput {
   congestion: number;
 }
 
-export function optimizeRoutes(input: RouteEvaluationInput): RouteAssessment {
+export async function optimizeRoutes(input: RouteEvaluationInput): Promise<RouteAssessment> {
   const { scenario, port, ratePerDay, congestion } = input;
   const loading = getLoadingPort(scenario.loadingPort);
   const portRef: PortReference = getPort(scenario.dischargePort);
   const cargoRef = getCargo(scenario.cargo);
 
-  const baseDistance = loading
-    ? corridorDistanceNm(
-        scenario.loadingPort,
-        scenario.dischargePort,
-        loading.lat,
-        loading.lon,
-        portRef.lat,
-        portRef.lon,
-      )
-    : 6400;
+  const origin = loading ? { lat: loading.lat, lng: loading.lon } : { lat: 0, lng: 0 };
+  const dest = { lat: portRef.lat, lng: portRef.lon };
+
+  // Get maritime route for direct path (primary)
+  const maritime = await getMaritimeRoute(origin, dest, 13.6);
+  const baseDistance = maritime.distanceNm > 0 ? Math.round(maritime.distanceNm) : 6400;
+  const baseDurationHours = maritime.durationHours;
+  const baseCoordinates = maritime.coordinates.length > 0 ? maritime.coordinates : [origin, dest];
 
   const options: RouteOption[] = VARIANTS.map((variant) => {
     const distance = Math.round(baseDistance * variant.distanceFactor);
     const speed = 13.6 * variant.speedFactor;
-    const transit = transitDays(distance, speed);
+    // For maritime route, duration based on actual route with speed adjustment
+    const transit = (baseDurationHours * variant.distanceFactor / variant.speedFactor) / 24;
     const cargoDays = scenario.quantity / Math.max(1, port.cargoHandlingCapacity * cargoRef.handlingFactor);
     const duration = round1(transit + cargoDays + 1.6);
 
@@ -150,26 +148,19 @@ export function optimizeRoutes(input: RouteEvaluationInput): RouteAssessment {
       `Projected schedule reliability ${Math.round(100 - variant.weatherRisk * 0.55)}% over the ${round1(transit)}-day passage.`,
     );
 
-    const coordinates: { lat: number; lng: number }[] = [];
-    if (loading) {
-      coordinates.push({ lat: loading.lat, lng: loading.lon });
-      // A single deterministic waypoint nudges the corridor off the pure
-      // great-circle so the alternatives are visually distinguishable while
-      // still being anchored on real coordinates.
-      if (variant.distanceFactor !== 1.0) {
-        const swing = (variant.distanceFactor - 1) * 46;
-        coordinates.push({
-          lat: round1((loading.lat + portRef.lat) / 2 + (portRef.lat >= loading.lat ? swing : -swing)),
-          lng: round1((loading.lon + portRef.lon) / 2 + (portRef.lon >= loading.lon ? -swing : swing)),
-        });
-      }
-      coordinates.push({ lat: portRef.lat, lng: portRef.lon });
-    }
+    // For the primary "direct" variant, use the actual maritime route
+    // For other variants, we can still show maritime-based paths with factors, but keep actual maritime coords for direct/recommended
+    let coordinates: { lat: number; lng: number }[] = baseCoordinates;
+    
+    // If variant is not direct, we could compute alternative maritime route with via points
+    // For now, for direct (distanceFactor ~ 1.0) use maritime route; others keep maritime route as primary shape
+    // but we could add waypoints to differentiate - but requirement says don't fake land avoidance by random waypoints
+    // The primary selected will be the recommended one; alternatives shown as is
 
     return {
       id: variant.id,
       name: variant.name,
-      label: variant.label,
+      label: variant.id === "direct" ? "Maritime route" : variant.label,
       loadingPort: scenario.loadingPort,
       dischargePort: scenario.dischargePort,
       distance,

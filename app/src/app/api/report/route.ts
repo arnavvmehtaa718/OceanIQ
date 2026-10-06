@@ -83,7 +83,7 @@ export async function POST(request: Request) {
     ...(typeof body === "object" ? body : {}),
   } as ProcurementScenario;
 
-  const result = runAnalysis(scenario);
+  const result = await runAnalysis(scenario);
 
   return NextResponse.json({
     reportId: result.scenarioId,

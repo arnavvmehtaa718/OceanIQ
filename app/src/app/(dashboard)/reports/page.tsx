@@ -18,6 +18,7 @@ import ChartCard from "@/components/ui/ChartCard";
 import DataTable, { type Column } from "@/components/ui/DataTable";
 import StatusBadge from "@/components/ui/StatusBadge";
 import LoadingState from "@/components/ui/LoadingState";
+import DownloadPdfButton from "@/components/domain/DownloadPdfButton";
 import { useAnalysis } from "@/hooks/useAnalysis";
 import { useAppStore, type GeneratedReport } from "@/store/useAppStore";
 import { formatNumber, formatUSD } from "@/lib/format";
@@ -111,19 +112,23 @@ export default function ReportsPage() {
           >
             <Eye className="size-3.5" />
           </button>
-          <button
-            onClick={() =>
-              pushToast({
-                kind: "success",
-                title: "Export queued",
-                description: `${r.name} (${r.format}) is being prepared for download.`,
-              })
-            }
-            className="grid size-7 place-items-center rounded-md border border-line text-secondary transition-colors hover:border-good/40 hover:text-good"
-            title="Download"
-          >
-            <Download className="size-3.5" />
-          </button>
+          {r.format === "PDF" ? (
+            <DownloadPdfButton analysis={r.analysis} reportName={r.name} compact />
+          ) : (
+            <button
+              onClick={() =>
+                pushToast({
+                  kind: "info",
+                  title: `${r.format} export is not part of this build`,
+                  description: "Only the PDF export is wired up; generate a PDF report to download it.",
+                })
+              }
+              className="grid size-7 place-items-center rounded-md border border-line text-secondary transition-colors hover:border-good/40 hover:text-good"
+              title={`Download ${r.format}`}
+            >
+              <Download className="size-3.5" />
+            </button>
+          )}
         </div>
       ),
     },
@@ -172,21 +177,10 @@ export default function ReportsPage() {
               >
                 <Eye className="size-4" /> {latest ? "Preview Brief" : "Generate Brief"}
               </button>
-              <button
-                onClick={() =>
-                  pushToast({
-                    kind: "success",
-                    title: "Export queued",
-                    description: latest
-                      ? `${latest.name} (${latest.format}) is being prepared for download.`
-                      : "Generate a report first, then export it.",
-                  })
-                }
-                disabled={!latest}
-                className="inline-flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-[12.5px] font-medium text-secondary transition-colors hover:border-accent/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Download className="size-4" /> Download {latest ? latest.format : format}
-              </button>
+              <DownloadPdfButton
+                analysis={(latest ? latest.analysis : analysis)}
+                reportName={latest ? latest.name : "Procurement Decision Report"}
+              />
             </div>
           </div>
         </div>

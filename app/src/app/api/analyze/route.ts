@@ -68,7 +68,7 @@ export async function POST(request: Request) {
   }
 
   const scenario = coerceScenario(body);
-  const result = runAnalysis(scenario);
+    const result = await runAnalysis(scenario);
   const includeReport = body.includeReport === true || body.includeReport === "true";
 
   return NextResponse.json({
@@ -91,7 +91,7 @@ export async function GET() {
       { status: 503 },
     );
   }
-  const result = runAnalysis(DEFAULT_SCENARIO);
+  const result = await runAnalysis(DEFAULT_SCENARIO);
   return NextResponse.json({
     scenario: result.scenario,
     scenarioId: result.scenarioId,

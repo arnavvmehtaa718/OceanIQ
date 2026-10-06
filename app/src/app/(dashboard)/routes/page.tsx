@@ -151,7 +151,7 @@ export default function RoutesPage() {
         <div className="xl:col-span-2">
           <ChartCard
             title="Recommended Corridor"
-            subtitle="Animating vessel position along the selected great-circle transit"
+            subtitle="Great-circle route on an OpenStreetMap basemap · pan, zoom and tap a corridor for its numbers"
             right={
               <span className="rounded-md bg-accent/12 px-2 py-1 text-[10.5px] font-medium uppercase tracking-wider text-accent">
                 {recommended.label}
@@ -159,11 +159,9 @@ export default function RoutesPage() {
             }
           >
             <RouteVisualization
-              origin={recommended.loadingPort}
-              destination={recommended.dischargePort}
-              distance={recommended.distance}
-              duration={recommended.duration}
-              risk={recommended.riskLevel}
+              selected={recommended}
+              alternatives={route.all}
+              vesselType={vessel.primary.type}
             />
           </ChartCard>
         </div>

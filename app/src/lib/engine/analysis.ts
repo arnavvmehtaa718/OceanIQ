@@ -77,7 +77,7 @@ function disclosure(): DataDisclosure {
   };
 }
 
-export function runAnalysis(scenario: ProcurementScenario): AnalysisResult {
+export async function runAnalysis(scenario: ProcurementScenario): Promise<AnalysisResult> {
   const started = Date.now();
 
   // 1. ML freight forecast --------------------------------------------------
@@ -114,13 +114,14 @@ export function runAnalysis(scenario: ProcurementScenario): AnalysisResult {
   // 5. Route ----------------------------------------------------------------
   // Congestion exposure is re-read for the vessel actually recommended, since a
   // larger class can change how fast it turns around.
-  const route = optimizeRoutes({
+  const routeResult = await optimizeRoutes({
     scenario,
     vessel: primaryVessel,
     port: ports.selected,
     ratePerDay: vessel.primary.impliedDailyRate,
     congestion,
   });
+  const route = routeResult;
 
   // 6. Cost -----------------------------------------------------------------
   const cost = computeCost({
